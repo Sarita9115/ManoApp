@@ -1,0 +1,2 @@
+# ManoApp
+Hand recognition program
