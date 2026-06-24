@@ -1,2 +1,2 @@
-# ManoApp
+# ManoApp-KaSaJoGio
 Hand recognition program
