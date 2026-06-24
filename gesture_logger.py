@@ -41,10 +41,21 @@ CSV_COLUMNS = [
     "gesture_name",
 ]
 
-# Identificacion de persona por similitud facial.
-FACE_EMBED_SIZE = (64, 64)
-FACE_SIMILARITY_THRESHOLD = 0.80  # mas alto = mas estricto para considerar "misma persona"
-FACE_SWITCH_CONFIRM_FRAMES = 5    # frames consecutivos necesarios para confirmar un cambio de persona
+# Identificacion de persona por reconocimiento facial real (YuNet + SFace,
+# modelos oficiales de OpenCV Zoo: https://github.com/opencv/opencv_zoo).
+# Mucho mas robusto que comparar pixeles crudos: SFace produce un embedding
+# de 128 numeros que representa la identidad de la cara, casi sin importar
+# cambios leves de pose, iluminacion o expresion.
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+FACE_DETECTION_MODEL = os.path.join(MODELS_DIR, "face_detection_yunet_2023mar.onnx")
+FACE_RECOGNITION_MODEL = os.path.join(MODELS_DIR, "face_recognition_sface_2021dec.onnx")
+
+# Umbral de similitud coseno recomendado por OpenCV Zoo para SFace (da una
+# tasa de falsos positivos baja). Mas alto = mas estricto para considerar
+# "misma persona"; bajalo un poco si crea demasiadas identidades nuevas para
+# la misma persona, subelo si confunde a dos personas distintas.
+FACE_SIMILARITY_THRESHOLD = 0.363
+FACE_SWITCH_CONFIRM_FRAMES = 5  # frames consecutivos necesarios para confirmar un cambio de persona
 
 # Puntas de dedo (tip) y su articulacion intermedia (pip) segun MediaPipe Hands.
 # El orden es: indice, medio, anular, menique. El pulgar se trata aparte porque
@@ -108,11 +119,11 @@ def count_extended_fingers(landmarks) -> tuple[int, bool]:
 
 class PersonIdentifier:
     """
-    Reconocimiento ligero de identidad basado en similitud facial, sin
-    dependencias pesadas (dlib/face_recognition): usa el detector Haar de
-    OpenCV para encontrar la cara y compara un "embedding" simple (imagen en
-    escala de grises, ecualizada y normalizada) contra una galeria de
-    personas ya vistas.
+    Reconocimiento de identidad basado en embeddings faciales reales
+    (SFace, via cv2.FaceRecognizerSF): cada cara detectada se alinea y se
+    convierte en un vector de 128 numeros que representa esa identidad.
+    Comparamos ese vector contra una galeria de personas ya vistas usando
+    similitud coseno (cv2.FaceRecognizerSF.match).
 
     Si la cara coincide con una persona conocida (similitud >= umbral),
     reutiliza su id. Si no coincide con nadie, registra una persona nueva.
@@ -122,56 +133,51 @@ class PersonIdentifier:
 
     def __init__(
         self,
+        recognizer: cv2.FaceRecognizerSF,
         similarity_threshold: float = FACE_SIMILARITY_THRESHOLD,
         switch_confirm_frames: int = FACE_SWITCH_CONFIRM_FRAMES,
     ):
+        self.recognizer = recognizer
         self.similarity_threshold = similarity_threshold
         self.switch_confirm_frames = switch_confirm_frames
 
         self.known_ids: list[str] = []
-        self.known_embeddings: list[np.ndarray] = []
+        self.known_features: list[np.ndarray] = []
         self.next_index = 1
 
         self.current_id: str | None = None
         self._pending_id: str | None = None
         self._pending_count = 0
 
-    @staticmethod
-    def _embed(face_gray: np.ndarray) -> np.ndarray:
-        face = cv2.resize(face_gray, FACE_EMBED_SIZE)
-        face = cv2.equalizeHist(face)
-        vector = face.astype(np.float32).flatten()
-        vector -= vector.mean()
-        norm = np.linalg.norm(vector)
-        if norm > 1e-6:
-            vector /= norm
-        return vector
-
-    def _register_new_person(self, embedding: np.ndarray) -> str:
+    def _register_new_person(self, feature: np.ndarray) -> str:
         person_id = f"Person_{self.next_index}"
         self.next_index += 1
         self.known_ids.append(person_id)
-        self.known_embeddings.append(embedding)
+        self.known_features.append(feature)
         return person_id
 
-    def identify(self, face_gray: np.ndarray) -> str:
-        """Devuelve el person_id (estable) para la cara recibida en este frame."""
-        embedding = self._embed(face_gray)
+    def identify(self, frame_bgr: np.ndarray, face_box: np.ndarray) -> str:
+        """
+        Devuelve el person_id (estable) para la cara detectada en este frame.
+        `face_box` es una fila tal cual la devuelve cv2.FaceDetectorYN.detect
+        (bounding box + 5 landmarks + score), necesaria para alinear la cara
+        antes de extraer su embedding.
+        """
+        aligned_face = self.recognizer.alignCrop(frame_bgr, face_box)
+        feature = self.recognizer.feature(aligned_face)
 
-        if not self.known_embeddings:
-            candidate_id = self._register_new_person(embedding)
+        if not self.known_features:
+            candidate_id = self._register_new_person(feature)
         else:
-            similarities = [float(np.dot(embedding, known)) for known in self.known_embeddings]
+            similarities = [
+                self.recognizer.match(feature, known, cv2.FaceRecognizerSF_FR_COSINE)
+                for known in self.known_features
+            ]
             best_idx = int(np.argmax(similarities))
             if similarities[best_idx] >= self.similarity_threshold:
                 candidate_id = self.known_ids[best_idx]
-                # Promedio movil del embedding para tolerar cambios leves de
-                # pose/iluminacion sin perder la identidad ya registrada.
-                updated = 0.9 * self.known_embeddings[best_idx] + 0.1 * embedding
-                norm = np.linalg.norm(updated)
-                self.known_embeddings[best_idx] = updated / norm if norm > 1e-6 else updated
             else:
-                candidate_id = self._register_new_person(embedding)
+                candidate_id = self._register_new_person(feature)
 
         return self._debounce(candidate_id)
 
@@ -270,10 +276,18 @@ def main() -> None:
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
 
-    face_detector = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    if not os.path.exists(FACE_DETECTION_MODEL) or not os.path.exists(FACE_RECOGNITION_MODEL):
+        raise RuntimeError(
+            "Faltan los modelos de cara en 'models/'. Descarga "
+            "face_detection_yunet_2023mar.onnx y face_recognition_sface_2021dec.onnx "
+            "desde https://github.com/opencv/opencv_zoo y colocalos en esa carpeta."
+        )
+
+    face_detector = cv2.FaceDetectorYN.create(
+        FACE_DETECTION_MODEL, "", (320, 320), score_threshold=0.85, nms_threshold=0.3, top_k=5000
     )
-    person_identifier = PersonIdentifier()
+    face_recognizer = cv2.FaceRecognizerSF.create(FACE_RECOGNITION_MODEL, "")
+    person_identifier = PersonIdentifier(face_recognizer)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -299,22 +313,23 @@ def main() -> None:
             # Espejamos la imagen para que se sienta como un espejo natural
             # (el usuario se ve a si mismo como en un espejo de pared).
             frame = cv2.flip(frame, 1)
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             # --- Identificacion de persona (cara) ---------------------------
             # Se hace sobre el frame YA espejado, que es exactamente lo mismo
             # que ve la persona y lo mismo que procesamos para las manos, asi
             # que no hay inconsistencia de orientacion entre cara y manos.
-            faces = face_detector.detectMultiScale(
-                gray_frame, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)
-            )
-            if len(faces) > 0:
+            frame_h, frame_w = frame.shape[:2]
+            face_detector.setInputSize((frame_w, frame_h))
+            _, faces = face_detector.detect(frame)
+
+            if faces is not None and len(faces) > 0:
                 # Si aparece mas de una cara, asumimos que la "activa" es la
                 # mas grande (la mas cercana a la camara), ya que la actividad
                 # es de una persona a la vez por estacion.
-                fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-                face_crop = gray_frame[fy:fy + fh, fx:fx + fw]
-                current_person_id = person_identifier.identify(face_crop)
+                face_box = max(faces, key=lambda f: f[2] * f[3])
+                current_person_id = person_identifier.identify(frame, face_box)
+
+                fx, fy, fw, fh = face_box[:4].astype(int)
                 cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (0, 200, 255), 2)
                 cv2.putText(frame, current_person_id, (fx, fy - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
