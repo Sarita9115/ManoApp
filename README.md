@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Gesture Recognition + Statistical Indicators
 
 Sistema de dos partes para la actividad de reconocimiento de gestos en vivo.
@@ -62,3 +63,7 @@ Imprime en consola:
 
 Si quieres comparar varios equipos, junta los CSV de cada estación en un solo
 archivo (mismas columnas) antes de correr `analyze_gestures.py`.
+=======
+# ManoApp-KaSaJoGio
+Hand recognition program
+>>>>>>> 96929a7df50509db791688844f987418e513271a
