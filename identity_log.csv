@@ -1,9 +1,0 @@
-timestamp,person_id,handedness,user_count,gesture_name
-2026-06-25T15:38:49.382804,Person_1,Right,1,1
-2026-06-25T15:38:51.641299,Person_1,Right,2,2
-2026-06-25T15:39:02.547167,Person_2,Left,0,Fist
-2026-06-25T15:39:04.416522,Person_2,Left,5,Open Palm
-2026-06-25T15:39:10.683036,Person_1,Right,1,1
-2026-06-25T15:39:12.742594,Person_1,Right,2,2
-2026-06-25T15:39:16.051111,Person_3,Right,0,Fist
-2026-06-25T15:39:16.077743,Person_3,Left,0,Fist

@@ -14,34 +14,44 @@ actividad, conectandolos con los conceptos de clase:
     (requestid) para ver diferencias de comportamiento.
 """
 
+import os
 import sys
 
 import pandas as pd
 
-CSV_PATH = "gestures_log.csv"
+CSV_CANDIDATES = ("gestures_log.csv", "identity_log.csv")
 TARGET_GESTURE = "Thumbs Up"  # Gesto de referencia para la proporcion
 
 
-def load_data(path: str) -> pd.DataFrame:
-    try:
-        df = pd.read_csv(path)
-    except FileNotFoundError:
-        print(f"No se encontro '{path}'. Corre primero gesture_logger.py para generar datos.")
-        sys.exit(1)
+def load_data(path: str | None = None) -> tuple[pd.DataFrame, str]:
+    paths_to_try = [path] if path else list(CSV_CANDIDATES)
 
-    if df.empty:
-        print(f"'{path}' existe pero no tiene detecciones todavia.")
-        sys.exit(1)
+    for candidate in paths_to_try:
+        if not candidate:
+            continue
+        if not os.path.exists(candidate):
+            continue
 
-    return df
+        df = pd.read_csv(candidate)
+        if df.empty:
+            print(f"'{candidate}' existe pero no tiene detecciones todavia.")
+            sys.exit(1)
+
+        return df, candidate
+
+    if path:
+        print(f"No se encontro '{path}'.")
+    else:
+        print("No se encontro 'gestures_log.csv' ni 'identity_log.csv'.")
+        print("Corre primero gesture_logger.py o genera un CSV con datos de gestos.")
+    sys.exit(1)
 
 
 def print_general_summary(df: pd.DataFrame) -> None:
     print("=" * 70)
     print("RESUMEN GENERAL (df.describe())")
     print("=" * 70)
-    # include="all" para que tambien resuma columnas categoricas
-    # (gesture_name, handedness, requestid), no solo user_count.
+    # include="all" para que tambien resuma columnas categoricas disponibles.
     print(df.describe(include="all"))
     print()
 
@@ -98,6 +108,16 @@ def print_station_comparison(df: pd.DataFrame) -> None:
     print("COMPARACION ENTRE ESTACIONES/EQUIPOS (requestid)")
     print("=" * 70)
 
+    if "requestid" not in df.columns:
+        print("Este CSV no tiene columna 'requestid', asi que no se puede comparar por estacion/equipo.")
+        print()
+        return
+
+    if df["requestid"].isna().all():
+        print("La columna 'requestid' existe pero esta vacia.")
+        print()
+        return
+
     station_summary = df.groupby("requestid").agg(
         total_detecciones=("gesture_name", "count"),
         promedio_dedos=("user_count", "mean"),
@@ -136,7 +156,11 @@ def print_person_comparison(df: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    df = load_data(CSV_PATH)
+    csv_path = sys.argv[1] if len(sys.argv) > 1 else None
+    df, source_path = load_data(csv_path)
+
+    print(f"Analizando: {source_path}")
+    print()
 
     print_general_summary(df)
     print_central_tendency(df)
