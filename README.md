@@ -36,13 +36,62 @@ python gesture_logger.py
   distintas vistas, gesto más común, % de Thumbs Up, conteo por mano).
   Presiona `q` para salir.
 
-> Nota sobre identificación de persona: usa un método ligero (cara detectada
-> con Haar cascade de OpenCV + comparación de similitud de la imagen de la
-> cara, sin librerías pesadas como `dlib`/`face_recognition`). Funciona mejor
-> con una persona a la vez frente a cámara, buena iluminación y mirando de
-> frente. Si dos personas se ven muy parecidas o hay poca luz, puede fallar el
-> re-reconocimiento; ajusta `FACE_SIMILARITY_THRESHOLD` en `gesture_logger.py`
-> si ves que crea demasiadas identidades nuevas o que confunde a dos personas.
+> Nota sobre identificación de persona: usa reconocimiento facial real con
+> los modelos oficiales de OpenCV Zoo — **YuNet** (detección, `cv2.FaceDetectorYN`)
+> + **SFace** (embedding de 128 numeros por cara, `cv2.FaceRecognizerSF`),
+> descargados en `models/`. Compara por similitud coseno contra las caras ya
+> vistas. Si dos personas se ven muy parecidas o hay poca luz, ajusta
+> `FACE_SIMILARITY_THRESHOLD` en `gesture_logger.py` (más alto = más estricto).
+
+### Parte 3 — Identidad por secuencia de gestos (sin depender de la cara)
+
+```bash
+python identity_sequence.py live
+```
+
+Esto resuelve el reto bonus del enunciado ("Gesture-Based Identity
+Recognition"), pero **sin requerir que se vea la cara**: identifica a la
+persona únicamente por la secuencia de gestos que hace con la mano.
+
+**Modo `live` (recomendado para el demo en clase)**: la cámara queda
+corriendo de forma continua. Cada persona hace su secuencia de gestos (ej.
+"1 dedo, 2 dedos, 3 dedos" o "Thumbs Up, Open Palm, 1 dedo") y, en cuanto
+deja de detectarse mano por `SEQUENCE_GAP_SECONDS` (≈1.8s, "se acabó su
+turno"), el sistema cierra esa secuencia y la compara contra todas las que
+ya conoce:
+
+- Si el **patrón** (gesto + mano, en orden) ya existe — de esta sesión o de
+  una anterior, porque las firmas se guardan en `identity_signatures.json` —
+  reconoce a esa persona, sin importar cuántas otras secuencias distintas
+  hayan pasado en medio, ni a qué velocidad la repita (el ritmo solo se
+  reporta como dato informativo, no es obligatorio que coincida).
+- Si el patrón es nuevo, lo registra automáticamente como una persona nueva
+  (`Person_1`, `Person_2`, ...) para reconocerla la próxima vez.
+- Cada gesto sin nombre clasificado (ej. 1, 2, 3, 4 dedos) se identifica por
+  su número de dedos, así que secuencias numéricas como "1, 2, 3" funcionan
+  igual que secuencias de gestos con nombre.
+
+**Modos manuales** (útiles para pruebas controladas o demostrar el registro
+explícito con nombre):
+
+```bash
+python identity_sequence.py enroll Ana
+python identity_sequence.py enroll Beto
+python identity_sequence.py verify
+```
+
+- `enroll <nombre>`: captura una secuencia fija de `SEQUENCE_LENGTH` pasos (4
+  por defecto) y la guarda con ese nombre en `identity_signatures.json`
+  (mismo archivo que usa el modo `live`, así que ambos modos comparten
+  galería de identidades).
+- `verify`: captura una secuencia y la compara contra todas las firmas
+  guardadas, exigiendo coincidencia exacta de patrón y reportando si el
+  ritmo cae dentro de `TIMING_TOLERANCE` (0.18 por defecto).
+
+Ajusta en `identity_sequence.py`: `SEQUENCE_GAP_SECONDS` (qué tan larga debe
+ser la pausa para cerrar un turno en modo `live`), `MIN_SEQUENCE_STEPS`
+(pasos mínimos para que cuente como secuencia real, evita registrar un solo
+gesto suelto como persona nueva), y `TIMING_TOLERANCE` (margen de ritmo).
 
 ### Parte 2 — Análisis estadístico
 
