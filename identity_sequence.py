@@ -29,10 +29,12 @@ Controles durante la captura:
     q -> salir / cancelar
 """
 
+import csv
 import json
 import os
 import sys
 import time
+from datetime import datetime
 
 import cv2
 import mediapipe as mp
@@ -60,6 +62,16 @@ TIMING_TOLERANCE = 0.18
 # cuando la transicion entre ellas ocurre en menos de SEQUENCE_GAP_SECONDS.
 HAND_REAPPEAR_THRESHOLD = 0.3
 
+IDENTITY_CSV_PATH = "identity_log.csv"
+IDENTITY_CSV_COLUMNS = ["timestamp", "person_id", "handedness", "user_count", "gesture_name"]
+
+
+def ensure_csv_header(path: str, columns: list) -> None:
+    """Crea el CSV con encabezado si todavia no existe."""
+    if not os.path.exists(path):
+        with open(path, mode="w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(columns)
+
 
 def load_signatures() -> dict:
     if not os.path.exists(SIGNATURES_PATH):
@@ -84,24 +96,62 @@ def _step_label(gesture_name: str, finger_count: int) -> str:
     return gesture_name if gesture_name != "Unknown" else str(finger_count)
 
 
-def _detect_hand_step(results, mp_drawing, mp_hands, frame):
+def _empty_hand_state() -> dict:
+    return {"gesture": None, "finger_count": None, "hold_start": None, "last_seen": None}
+
+
+def _extract_hand_detections(results, mp_drawing, mp_hands, frame) -> list[dict]:
     """
-    Si hay una mano en este frame, dibuja sus landmarks y devuelve
-    (etiqueta_del_paso, mano). Si no hay mano, devuelve (None, None).
+    Devuelve todas las manos detectadas en el frame con su etiqueta de gesto.
+    Cada deteccion contiene: hand, gesture y finger_count.
     """
     if not (results.multi_hand_landmarks and results.multi_handedness):
-        return None, None
+        return []
 
-    hand_landmarks = results.multi_hand_landmarks[0]
-    handedness = results.multi_handedness[0]
-    mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+    detections: list[dict] = []
+    for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-    landmarks = hand_landmarks.landmark
-    finger_count, thumb_extended = count_extended_fingers(landmarks)
-    gesture_name = classify_gesture(finger_count, thumb_extended, landmarks)
-    label = _step_label(gesture_name, finger_count)
-    hand_label = handedness.classification[0].label
-    return label, hand_label
+        landmarks = hand_landmarks.landmark
+        finger_count, thumb_extended = count_extended_fingers(landmarks)
+        gesture_name = classify_gesture(finger_count, thumb_extended, landmarks)
+        label = _step_label(gesture_name, finger_count)
+        hand_label = handedness.classification[0].label
+        detections.append({
+            "gesture": label,
+            "hand": hand_label,
+            "finger_count": finger_count,
+        })
+
+    detections.sort(key=lambda item: item["hand"])
+    return detections
+
+
+def _finalize_hand_step(hand_label: str, state: dict, now: float, last_step_end: float | None) -> dict | None:
+    gesture = state.get("gesture")
+    hold_start = state.get("hold_start")
+    finger_count = state.get("finger_count")
+
+    state["gesture"] = None
+    state["finger_count"] = None
+    state["hold_start"] = None
+    state["last_seen"] = None
+
+    if gesture is None or hold_start is None:
+        return None
+
+    held = now - hold_start
+    if held < MIN_HOLD_SECONDS:
+        return None
+
+    gap_before = (hold_start - last_step_end) if last_step_end else 0.0
+    return {
+        "gesture": gesture,
+        "hand": hand_label,
+        "finger_count": finger_count,
+        "hold_seconds": round(held, 3),
+        "gap_before_seconds": round(max(gap_before, 0.0), 3),
+    }
 
 
 def capture_sequence(sequence_length: int = SEQUENCE_LENGTH) -> list[dict]:
@@ -124,16 +174,14 @@ def capture_sequence(sequence_length: int = SEQUENCE_LENGTH) -> list[dict]:
         raise RuntimeError("No se pudo abrir la webcam (indice 0).")
 
     steps: list[dict] = []
-    active_gesture = None
-    active_hand = None
-    hold_start = None
+    active_states = {"Left": _empty_hand_state(), "Right": _empty_hand_state()}
     last_step_end = None
 
     with mp_hands.Hands(
         model_complexity=0,
         min_detection_confidence=0.6,
         min_tracking_confidence=0.6,
-        max_num_hands=1,
+        max_num_hands=2,
     ) as hands:
         while len(steps) < sequence_length:
             ok, frame = cap.read()
@@ -145,34 +193,64 @@ def capture_sequence(sequence_length: int = SEQUENCE_LENGTH) -> list[dict]:
             results = hands.process(rgb_frame)
             now = time.time()
 
-            detected_gesture, detected_hand = _detect_hand_step(results, mp_drawing, mp_hands, frame)
+            detections = _extract_hand_detections(results, mp_drawing, mp_hands, frame)
+            seen_hands = set()
+            sequence_done = False
 
-            if detected_gesture is not None:
-                if detected_gesture != active_gesture or detected_hand != active_hand:
-                    # Empieza un gesto nuevo (o el primero de la secuencia).
-                    active_gesture, active_hand, hold_start = detected_gesture, detected_hand, now
-                # Si es el mismo gesto que ya se estaba sosteniendo, no hacemos
-                # nada: sigue corriendo el cronometro de hold_start.
-            else:
-                # Se perdio el gesto claro: si se habia sostenido lo suficiente,
-                # se cierra como un paso confirmado de la secuencia.
-                if active_gesture is not None and hold_start is not None:
-                    held = now - hold_start
-                    if held >= MIN_HOLD_SECONDS:
-                        gap_before = (hold_start - last_step_end) if last_step_end else 0.0
-                        steps.append({
-                            "gesture": active_gesture,
-                            "hand": active_hand,
-                            "hold_seconds": round(held, 3),
-                            "gap_before_seconds": round(max(gap_before, 0.0), 3),
-                        })
+            for detection in detections:
+                hand_label = detection["hand"]
+                seen_hands.add(hand_label)
+                state = active_states.setdefault(hand_label, _empty_hand_state())
+
+                if state["gesture"] is None:
+                    state["gesture"] = detection["gesture"]
+                    state["finger_count"] = detection["finger_count"]
+                    state["hold_start"] = now
+                    state["last_seen"] = now
+                    continue
+
+                if detection["gesture"] != state["gesture"]:
+                    step = _finalize_hand_step(hand_label, state, now, last_step_end)
+                    if step is not None:
+                        steps.append(step)
                         last_step_end = now
-                active_gesture, active_hand, hold_start = None, None, None
+                        if len(steps) >= sequence_length:
+                            sequence_done = True
+                            break
 
-            _draw_capture_hud(frame, steps, sequence_length, active_gesture, active_hand, hold_start, now)
+                    state["gesture"] = detection["gesture"]
+                    state["finger_count"] = detection["finger_count"]
+                    state["hold_start"] = now
+                    state["last_seen"] = now
+
+                state["last_seen"] = now
+
+            if not sequence_done:
+                for hand_label, state in active_states.items():
+                    if hand_label in seen_hands:
+                        continue
+
+                    if state["gesture"] is None or state["last_seen"] is None:
+                        continue
+
+                    if (now - state["last_seen"]) < HAND_REAPPEAR_THRESHOLD:
+                        continue
+
+                    step = _finalize_hand_step(hand_label, state, now, last_step_end)
+                    if step is not None:
+                        steps.append(step)
+                        last_step_end = now
+                        if len(steps) >= sequence_length:
+                            sequence_done = True
+                            break
+
+            _draw_capture_hud(frame, steps, sequence_length, active_states, now)
             cv2.imshow("Captura de secuencia de identidad - 'q' para cancelar", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+            if sequence_done:
                 break
 
     cap.release()
@@ -180,14 +258,18 @@ def capture_sequence(sequence_length: int = SEQUENCE_LENGTH) -> list[dict]:
     return steps
 
 
-def _draw_capture_hud(frame, steps, sequence_length, active_gesture, active_hand, hold_start, now) -> None:
+def _draw_capture_hud(frame, steps, sequence_length, active_states, now) -> None:
     cv2.putText(frame, f"Paso {len(steps) + 1}/{sequence_length}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-    if active_gesture is not None:
-        held = now - hold_start
-        cv2.putText(frame, f"{active_hand} - {active_gesture} ({held:.1f}s)", (10, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    y = 65
+    for hand_label in ("Left", "Right"):
+        state = active_states.get(hand_label)
+        if state and state["gesture"] is not None and state["hold_start"] is not None:
+            held = now - state["hold_start"]
+            cv2.putText(frame, f"{hand_label} - {state['gesture']} ({held:.1f}s)", (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            y += 25
 
     for i, step in enumerate(steps):
         text = (f"{i + 1}. {step['hand']} {step['gesture']} "
@@ -290,11 +372,11 @@ def _next_free_person_id(signatures: dict) -> str:
 
 def _close_turn(
     sequence: list[dict], signatures: dict
-) -> tuple[str, dict]:
+) -> tuple[str, str, dict]:
     """
     Evalua una secuencia completada: reconoce a la persona si su patron ya
-    existe, o la registra como nueva. Devuelve el texto de resultado y el
-    diccionario de firmas (posiblemente actualizado).
+    existe, o la registra como nueva. Devuelve (texto_resultado, person_id,
+    signatures actualizado).
     """
     person, timing_error = find_matching_person(sequence, signatures)
     if person is None:
@@ -307,7 +389,7 @@ def _close_turn(
         result_text = f"Reconocido: {person}{timing_note}"
     print(f"[{time.strftime('%H:%M:%S')}] {result_text} "
           f"(secuencia: {[(s['hand'], s['gesture']) for s in sequence]})")
-    return result_text, signatures
+    return result_text, person, signatures
 
 
 def run_live() -> None:
@@ -329,6 +411,8 @@ def run_live() -> None:
         esa persona aunque hayan pasado otras secuencias distintas en medio.
       - Si el patron es nuevo, se registra automaticamente como Person_N.
     """
+    ensure_csv_header(IDENTITY_CSV_PATH, IDENTITY_CSV_COLUMNS)
+
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
 
@@ -340,19 +424,29 @@ def run_live() -> None:
         raise RuntimeError("No se pudo abrir la webcam (indice 0).")
 
     current_sequence: list[dict] = []
-    active_gesture = None
-    active_hand = None
-    hold_start = None
+    current_turn_rows: list[list] = []   # filas CSV pendientes del turno actual
+    active_states = {"Left": _empty_hand_state(), "Right": _empty_hand_state()}
     last_step_end = None
     no_hand_since = None
     last_result_text = ""
+
+    def flush_turn(seq, rows, sigs):
+        """Cierra el turno, resuelve el person_id y vuelca las filas al CSV."""
+        result_text, person_id, sigs = _close_turn(seq, sigs)
+        for row in rows:
+            row[1] = person_id   # columna person_id
+            writer.writerow(row)
+        csv_file.flush()
+        return result_text, sigs
 
     with mp_hands.Hands(
         model_complexity=0,
         min_detection_confidence=0.6,
         min_tracking_confidence=0.6,
-        max_num_hands=1,
-    ) as hands:
+        max_num_hands=2,
+    ) as hands, open(IDENTITY_CSV_PATH, mode="a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -363,48 +457,107 @@ def run_live() -> None:
             results = hands.process(rgb_frame)
             now = time.time()
 
-            detected_gesture, detected_hand = _detect_hand_step(results, mp_drawing, mp_hands, frame)
+            detections = _extract_hand_detections(results, mp_drawing, mp_hands, frame)
 
-            if detected_gesture is not None:
-                # Caso (a): llego una mano nueva despues de un gap real.
-                # Si habia una secuencia en curso, cerrarla ANTES de continuar
-                # para que los gestos de esta persona no se mezclen con los anteriores.
+            if detections:
                 if no_hand_since is not None and current_sequence:
                     gap = now - no_hand_since
                     if gap >= HAND_REAPPEAR_THRESHOLD:
                         if len(current_sequence) >= MIN_SEQUENCE_STEPS:
-                            last_result_text, signatures = _close_turn(current_sequence, signatures)
+                            last_result_text, signatures = flush_turn(current_sequence, current_turn_rows, signatures)
                         current_sequence = []
+                        current_turn_rows = []
                         last_step_end = None
 
                 no_hand_since = None
-                if detected_gesture != active_gesture or detected_hand != active_hand:
-                    active_gesture, active_hand, hold_start = detected_gesture, detected_hand, now
+                seen_hands = set()
+
+                for detection in detections:
+                    hand_label = detection["hand"]
+                    seen_hands.add(hand_label)
+                    state = active_states.setdefault(hand_label, _empty_hand_state())
+
+                    if state["gesture"] is None:
+                        state["gesture"] = detection["gesture"]
+                        state["finger_count"] = detection["finger_count"]
+                        state["hold_start"] = now
+                        state["last_seen"] = now
+                        continue
+
+                    if detection["gesture"] != state["gesture"]:
+                        step = _finalize_hand_step(hand_label, state, now, last_step_end)
+                        if step is not None:
+                            current_sequence.append(step)
+                            current_turn_rows.append([
+                                datetime.now().isoformat(),
+                                "Pending",
+                                step["hand"],
+                                step["finger_count"],
+                                step["gesture"],
+                            ])
+                            last_step_end = now
+
+                        state["gesture"] = detection["gesture"]
+                        state["finger_count"] = detection["finger_count"]
+                        state["hold_start"] = now
+                        state["last_seen"] = now
+
+                    state["last_seen"] = now
+
+                for hand_label, state in active_states.items():
+                    if hand_label in seen_hands:
+                        continue
+
+                    if state["gesture"] is None or state["last_seen"] is None:
+                        continue
+
+                    if (now - state["last_seen"]) < HAND_REAPPEAR_THRESHOLD:
+                        continue
+
+                    step = _finalize_hand_step(hand_label, state, now, last_step_end)
+                    if step is not None:
+                        current_sequence.append(step)
+                        current_turn_rows.append([
+                            datetime.now().isoformat(),
+                            "Pending",
+                            step["hand"],
+                            step["finger_count"],
+                            step["gesture"],
+                        ])
+                        last_step_end = now
+
             else:
                 if no_hand_since is None:
                     no_hand_since = now
 
-                if active_gesture is not None and hold_start is not None:
-                    held = now - hold_start
-                    if held >= MIN_HOLD_SECONDS:
-                        gap_before = (hold_start - last_step_end) if last_step_end else 0.0
-                        current_sequence.append({
-                            "gesture": active_gesture,
-                            "hand": active_hand,
-                            "hold_seconds": round(held, 3),
-                            "gap_before_seconds": round(max(gap_before, 0.0), 3),
-                        })
+                for hand_label, state in active_states.items():
+                    if state["gesture"] is None or state["last_seen"] is None:
+                        continue
+
+                    if (now - state["last_seen"]) < HAND_REAPPEAR_THRESHOLD:
+                        continue
+
+                    step = _finalize_hand_step(hand_label, state, now, last_step_end)
+                    if step is not None:
+                        current_sequence.append(step)
+                        current_turn_rows.append([
+                            datetime.now().isoformat(),
+                            "Pending",
+                            step["hand"],
+                            step["finger_count"],
+                            step["gesture"],
+                        ])
                         last_step_end = now
-                    active_gesture, active_hand, hold_start = None, None, None
 
                 # Caso (b): nadie ha vuelto a aparecer -> cierre por timeout.
                 if current_sequence and (now - no_hand_since) >= SEQUENCE_GAP_SECONDS:
                     if len(current_sequence) >= MIN_SEQUENCE_STEPS:
-                        last_result_text, signatures = _close_turn(current_sequence, signatures)
+                        last_result_text, signatures = flush_turn(current_sequence, current_turn_rows, signatures)
                     current_sequence = []
+                    current_turn_rows = []
                     last_step_end = None
 
-            _draw_live_hud(frame, current_sequence, active_gesture, active_hand, hold_start, now, last_result_text)
+            _draw_live_hud(frame, current_sequence, active_states, now, last_result_text)
             cv2.imshow("Identidad por secuencia (live) - 'q' para salir", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -414,14 +567,18 @@ def run_live() -> None:
     cv2.destroyAllWindows()
 
 
-def _draw_live_hud(frame, current_sequence, active_gesture, active_hand, hold_start, now, last_result_text) -> None:
+def _draw_live_hud(frame, current_sequence, active_states, now, last_result_text) -> None:
     cv2.putText(frame, f"Pasos del turno actual: {len(current_sequence)}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    if active_gesture is not None:
-        held = now - hold_start
-        cv2.putText(frame, f"{active_hand} - {active_gesture} ({held:.1f}s)", (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2)
+    y = 60
+    for hand_label in ("Left", "Right"):
+        state = active_states.get(hand_label)
+        if state and state["gesture"] is not None and state["hold_start"] is not None:
+            held = now - state["hold_start"]
+            cv2.putText(frame, f"{hand_label} - {state['gesture']} ({held:.1f}s)", (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2)
+            y += 24
 
     for i, step in enumerate(current_sequence):
         text = f"{i + 1}. {step['hand']} {step['gesture']}"

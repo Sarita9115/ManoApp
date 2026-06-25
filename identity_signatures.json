@@ -1,0 +1,56 @@
+{
+  "Person_1": {
+    "steps": [
+      {
+        "gesture": "1",
+        "hand": "Right",
+        "finger_count": 1,
+        "hold_seconds": 2.399,
+        "gap_before_seconds": 0.0
+      },
+      {
+        "gesture": "2",
+        "hand": "Right",
+        "finger_count": 2,
+        "hold_seconds": 2.259,
+        "gap_before_seconds": 0.0
+      }
+    ]
+  },
+  "Person_2": {
+    "steps": [
+      {
+        "gesture": "Fist",
+        "hand": "Left",
+        "finger_count": 0,
+        "hold_seconds": 2.532,
+        "gap_before_seconds": 0.0
+      },
+      {
+        "gesture": "Open Palm",
+        "hand": "Left",
+        "finger_count": 5,
+        "hold_seconds": 1.869,
+        "gap_before_seconds": 0.0
+      }
+    ]
+  },
+  "Person_3": {
+    "steps": [
+      {
+        "gesture": "Fist",
+        "hand": "Right",
+        "finger_count": 0,
+        "hold_seconds": 0.599,
+        "gap_before_seconds": 0.0
+      },
+      {
+        "gesture": "Fist",
+        "hand": "Left",
+        "finger_count": 0,
+        "hold_seconds": 0.626,
+        "gap_before_seconds": 0.0
+      }
+    ]
+  }
+}
